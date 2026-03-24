@@ -1,3 +1,10 @@
 {
-    "ROS2.distro": "jazzy"
+    "ROS2.distro": "jazzy",
+    "python-envs.pythonProjects": [
+        {
+            "path": ".",
+            "envManager": "ms-python.python:venv",
+            "packageManager": "ms-python.python:pip"
+        }
+    ]
 }
