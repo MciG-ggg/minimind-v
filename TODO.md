@@ -1,0 +1,3 @@
+- [ ] cli传参用tyro
+- [ ] 走通 VLM pretrain 流程
+- [ ] 适配 VLA0 风格
