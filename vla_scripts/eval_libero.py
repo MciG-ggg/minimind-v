@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import multiprocessing
 from pathlib import Path
 
 # 必须在导入 mujoco/libero 之前设置，以避免 EGL 初始化错误
@@ -20,13 +21,11 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.table import Table
 
-# rich_helpers 和本脚本同目录，动态加路径确保 import 可靠
-# 项目根目录 (含 model/) 也加入路径以便 from model.model_vla import VLAModel
+# 项目根目录加入 sys.path（使 vla_scripts 成为可导入的包）
 _script_dir = Path(__file__).parent
 _root_dir = _script_dir.parent
-sys.path.insert(0, str(_script_dir))
-sys.path.insert(0, str(_root_dir))
-from rich_helpers import ok, warn, err, fatal, section, kv_table, console
+sys.path.insert(0, str(_root_dir))  # 使 vla_scripts 可导入
+from vla_scripts.rich_helpers import ok, warn, err, fatal, section, kv_table, console
 
 import tyro
 from libero.libero.benchmark import get_benchmark
@@ -86,9 +85,9 @@ def generate_markdown_report(summary: dict, output_dir: str, cfg) -> str:
     md_lines.append("|---|---------|------|------|------|------|")
     for r in summary["per_task_results"]:
         status = "✅" if r["success"] else "❌"
-        instruction = r["instruction"]
-        if len(instruction) > 40:
-            instruction = instruction[:40] + "..."
+        instruction = r.get("instruction", "")
+        if len(instruction) > 80:
+            instruction = instruction[:80] + "..."
         md_lines.append(
             f"| {r['task_idx']:02d} | {instruction} | {status} | "
             f"{r['episode_return']:.3f} | {r['episode_len']} | {r['elapsed_s']:.1f}s |"
@@ -104,11 +103,61 @@ def generate_markdown_report(summary: dict, output_dir: str, cfg) -> str:
 
 
 # ==============================================================================
+# 多 GPU 并行 worker（单 GPU 模式不使用）
+# ==============================================================================
+
+def _eval_single_task_spawn(args: tuple) -> dict:
+    """单个任务评测，在独立 worker 进程中执行。
+    每个 worker 进程加载自己的 VLA 模型副本，绑定到指定 GPU。
+    使用 spawn 模式避免 fork+CUDA 的兼容性问题。
+    """
+    (task_idx, bddl_path, instruction, max_steps, save_dir, verbose, seed,
+     checkpoint, max_new_tokens, temperature, gpu_id) = args
+
+    # 每个 worker 绑定到独立 GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    np.random.seed(seed + task_idx)
+    torch.manual_seed(seed + task_idx)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed + task_idx)
+
+    # 在 worker 进程内加载模型
+    do_sample = temperature > 0
+    vla = VLAModel(checkpoint, device="cuda", dual_image=True,
+                   max_new_tokens=max_new_tokens,
+                   temperature=temperature, do_sample=do_sample)
+
+    task_env = OffScreenRenderEnv(bddl_file_name=bddl_path)
+    t0 = time.time()
+    # worker_id = gpu_id，用于在 verbose=True 时标识输出来源
+    result = evaluate_task(
+        vla=vla,
+        env=task_env,
+        instruction=instruction,
+        max_steps=max_steps,
+        save_dir=save_dir,
+        fps=30,
+        verbose=verbose,
+        worker_id=gpu_id,
+    )
+    result["task_idx"] = task_idx
+    result["instruction"] = instruction
+    result["elapsed_s"] = time.time() - t0
+    return result
+
+
+# ==============================================================================
 # 评测流程
 # ==============================================================================
 
-def evaluate_task(vla: VLAModel, env: OffScreenRenderEnv, instruction: str, max_steps: int, save_dir: str, fps: int = 30, verbose: bool = True) -> dict:
-    """在单个任务上执行一个 episode，可选保存帧图像和视频"""
+def evaluate_task(vla: VLAModel, env: OffScreenRenderEnv, instruction: str, max_steps: int, save_dir: str, fps: int = 30, verbose: bool = True, worker_id: int = 0) -> dict:
+    """在单个任务上执行一个 episode，可选保存帧图像和视频
+
+    Args:
+        worker_id: 仅在 verbose=True 时用于打印前缀标识，避免多 worker 输出交织
+    """
+    import sys
     obs = env.reset()
     episode_return = 0.0
     episode_len = 0
@@ -116,10 +165,10 @@ def evaluate_task(vla: VLAModel, env: OffScreenRenderEnv, instruction: str, max_
     success = False
     frames = []
 
-    # 打印任务指令
+    # 打印任务指令（多 GPU 时 worker_id 用于区分来源）
     if verbose:
-        section(f"任务指令: {instruction}", "yellow")
-        console.print()
+        prefix = f"[Worker-{worker_id}] " if worker_id > 0 else ""
+        print(f"{prefix}指令: {instruction}", flush=True)
 
     for step in range(max_steps):
         rgb = obs["agentview_image"]
@@ -136,39 +185,54 @@ def evaluate_task(vla: VLAModel, env: OffScreenRenderEnv, instruction: str, max_
 
         # 调试输出：显示 VLA 推理结果
         if verbose:
-            console.print(f"[dim]Step {step:3d}[/dim] | Action: {action.round(3)}")
+            prefix = f"[Worker-{worker_id}] " if worker_id > 0 else ""
+            action_str = " ".join(f"{v:+.3f}" for v in action.round(3))
+            print(f"{prefix}Step {step:3d} | {action_str}", flush=True)
 
         obs, reward, done, info_ = env.step(action)
         episode_return += reward
         episode_len += 1
 
-        # 采集帧（所有帧用于合成视频，按需保存 PNG）
+        # 采集帧（所有帧用于合成视频）
         if save_dir:
             frames.append(_flip_frame(rgb))
-            if step % 50 == 0:
-                p = Path(save_dir) / f"step_{step:04d}.png"
-                p.parent.mkdir(parents=True, exist_ok=True)
-                Image.fromarray(_flip_frame(rgb)).save(p)
 
         if done or info_.get("success", False):
             success = info_.get("success", False)
             break
 
-    # 保存视频（帧已在采集时翻转，直接写入）
+    # 保存视频
     if save_dir and frames:
         video_path = Path(save_dir) / "rollout.mp4"
         video_path.parent.mkdir(parents=True, exist_ok=True)
         with imageio.get_writer(video_path, fps=fps, codec="libx264", pixelformat="yuv420p") as writer:
             for frame in frames:
                 writer.append_data(frame)
-        warn(f"视频已保存: {video_path}")
+        # 保存每个 task 的评测结果 JSON（含完整 instruction）
+        task_result = {
+            "success": success,
+            "episode_return": float(episode_return),
+            "episode_len": episode_len,
+            "instruction": instruction,
+            "max_steps": max_steps,
+        }
+        result_path = Path(save_dir) / "result.json"
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(task_result, f, ensure_ascii=False, indent=2)
+        print(f"[Worker-{worker_id}] 完成: {video_path} | {result_path}", flush=True)
 
-    return {"success": success, "episode_return": episode_return, "episode_len": episode_len}
+    return {
+        "success": success,
+        "episode_return": episode_return,
+        "episode_len": episode_len,
+        "instruction": instruction,
+    }
 
 
 def run_eval(checkpoint: str, model_id: str, task_suite: str, num_episodes: int,
-             max_steps: int, max_new_tokens: int, output_dir: str, device: str,
-             seed: int, verbose: bool = True) -> dict:
+             max_steps: int, max_new_tokens: int, temperature: float,
+             output_dir: str, device: str,
+             seed: int, verbose: bool = True, num_workers: int | None = None) -> dict:
 
     # 种子
     np.random.seed(seed)
@@ -180,13 +244,16 @@ def run_eval(checkpoint: str, model_id: str, task_suite: str, num_episodes: int,
 
     # 加载 VLA 模型
     section("加载 VLA 模型", "cyan")
-    vla = VLAModel(checkpoint, device=device, dual_image=True, max_new_tokens=max_new_tokens)
+    vla = VLAModel(checkpoint, device=device, dual_image=True, max_new_tokens=max_new_tokens,
+                   temperature=temperature, do_sample=temperature > 0)
     ok(f"模型已加载到 {device}")
     kv_table("模型信息", [
         ("checkpoint", checkpoint),
         ("device", device),
         ("processor", vla.processor.__class__.__name__),
         ("max_new_tokens", str(max_new_tokens)),
+        ("temperature", str(temperature)),
+        ("do_sample", str(temperature > 0)),
     ])
     console.print()
 
@@ -197,7 +264,11 @@ def run_eval(checkpoint: str, model_id: str, task_suite: str, num_episodes: int,
     ok(f"Suite: {task_suite}, 共 {len(tasks)} 个任务，评测前 {num_episodes} 个")
     console.print()
 
-    # 逐任务评测 + 实时表格
+    # 自适应并行策略
+    num_gpus = torch.cuda.device_count()
+    section("开始评测", "cyan")
+    ok(f"检测到 {num_gpus} GPU(s)，{'多 GPU 并行模式' if num_gpus >= 2 else '单 GPU 串行模式（CPU/GPU 流水线并行）'}\n")
+
     results = []
     task_table = Table(title="评测进度", box=None)
     task_table.add_column("#", style="cyan", justify="right", width=3)
@@ -207,37 +278,83 @@ def run_eval(checkpoint: str, model_id: str, task_suite: str, num_episodes: int,
     task_table.add_column("步数", style="yellow", width=5)
     task_table.add_column("耗时", style="dim", width=6)
 
-    section("开始评测", "cyan")
-    for task_idx, task in enumerate(tasks[:num_episodes]):
-        instruction = task.language
-        bddl_path = benchmark.get_task_bddl_file_path(task_idx)
-        task_env = OffScreenRenderEnv(bddl_file_name=bddl_path)
-        save_dir = os.path.join(output_dir, f"task_{task_idx:02d}") if True else ""
+    if num_gpus >= 2:
+        # 多 GPU 模式：multiprocessing spawn + Pool，每个 worker 独占 1 GPU
+        # 必须用 spawn（而非 fork）避免 CUDA 在子进程中处于不确定状态
+        # 每个 worker 在进程内独立加载模型，通过 CUDA_VISIBLE_DEVICES 绑定 GPU
+        #
+        # 【输出控制】多 GPU 时强制 verbose=False，避免多进程同时打印造成交织混乱
+        # 每个 worker 的评估详情不输出，只在 pool 结束后统一打印汇总表格
+        tasks_args = []
+        for task_idx, task in enumerate(tasks[:num_episodes]):
+            bddl_path = benchmark.get_task_bddl_file_path(task_idx)
+            save_dir = os.path.join(output_dir, f"task_{task_idx:02d}")
+            # 每个任务分配一个 GPU（轮转），verbose=False 避免交织输出
+            gpu_id = task_idx % num_gpus
+            tasks_args.append((
+                task_idx, bddl_path, task.language, max_steps, save_dir, False, seed,
+                checkpoint, max_new_tokens, temperature, gpu_id
+            ))
 
-        t0 = time.time()
-        result = evaluate_task(
-            vla=vla, env=task_env,
-            instruction=instruction,
-            max_steps=max_steps, save_dir=save_dir,
-            verbose=verbose,
-        )
-        elapsed = time.time() - t0
+        num_workers = min(num_episodes, num_workers or num_gpus)
+        gpu_ids = list(range(num_gpus))
+        kv_table("并行配置", [
+            ("模式", "多 GPU multiprocessing.Pool + spawn（每任务独占 1 GPU）"),
+            ("GPU 数量", str(num_gpus)),
+            ("Worker 数", str(num_workers)),
+            ("GPU 分配", str(gpu_ids[:num_workers])),
+        ])
 
-        result["task_idx"] = task_idx
-        result["instruction"] = instruction
-        result["elapsed_s"] = elapsed
-        results.append(result)
+        # 使用 spawn 避免 fork+CUDA 死锁，每个 worker 独立加载模型
+        # 先收集所有结果，再统一打印（避免交织输出）
+        all_results = []
+        ctx = multiprocessing.get_context("spawn")
+        print(f"  [并行评测中，共 {num_episodes} 个任务，完成后显示结果...]", end="", flush=True)
+        with ctx.Pool(processes=num_workers) as pool:
+            for result in pool.imap_unordered(_eval_single_task_spawn, tasks_args):
+                all_results.append(result)
+                print(f"\r  [已完成 {len(all_results)}/{num_episodes}]", end="", flush=True)
+        print()  # 换行，准备打印最终表格
 
-        status = "[green]✓ SUCCESS[/green]" if result["success"] else "[red]✗ FAIL[/red]"
-        task_table.add_row(
-            f"{task_idx:02d}",
-            instruction[:50] + "...",
-            status,
-            f"{result['episode_return']:.3f}",
-            str(result["episode_len"]),
-            f"{elapsed:.1f}s",
-        )
-        console.print(task_table, end="\r")
+        # pool 结束后统一打印汇总（此时无交织风险）
+        for result in sorted(all_results, key=lambda r: r["task_idx"]):
+            status = "[green]✓ SUCCESS[/green]" if result["success"] else "[red]✗ FAIL[/red]"
+            task_table.add_row(
+                f"{result['task_idx']:02d}",
+                result["instruction"][:50] + "...",
+                status,
+                f"{result['episode_return']:.3f}",
+                str(result["episode_len"]),
+                f"{result['elapsed_s']:.1f}s",
+            )
+        results = all_results
+        console.print(task_table)
+    else:
+        # 单 GPU 模式：串行评测，CPU 仿真和 GPU 推理天然流水线并行
+        # 实时打印进度条，无交织问题
+        for task_idx, task in enumerate(tasks[:num_episodes]):
+            instruction = task.language
+            bddl_path = benchmark.get_task_bddl_file_path(task_idx)
+            task_env = OffScreenRenderEnv(bddl_file_name=bddl_path)
+            save_dir = os.path.join(output_dir, f"task_{task_idx:02d}")
+
+            t0 = time.time()
+            result = evaluate_task(
+                vla=vla, env=task_env,
+                instruction=instruction,
+                max_steps=max_steps, save_dir=save_dir,
+                verbose=verbose,
+            )
+            elapsed = time.time() - t0
+
+            result["task_idx"] = task_idx
+            result["instruction"] = instruction
+            result["elapsed_s"] = elapsed
+            results.append(result)
+
+            # 简洁的实时进度：一行覆盖，无rich table交织
+            status = "✓ SUCCESS" if result["success"] else "✗ FAIL   "
+            print(f"\r  [{task_idx+1}/{num_episodes}] {instruction[:50]:<50} {status}  奖励={result['episode_return']:.3f}  步数={result['episode_len']}  {elapsed:.0f}s", flush=True)
 
     console.print()  # 换行
 
@@ -303,11 +420,13 @@ if __name__ == "__main__":
         task_suite: str = "LIBERO_OBJECT"
         num_episodes: int = 10
         max_steps: int = 400
-        max_new_tokens: int = 64
+        max_new_tokens: int = 28  # 【方案 C】7 actions × 3 digits + 6 spaces = 27 tokens + 1 buffer
+        temperature: float = 0.3   # 采样温度，0.0=贪婪解码，>0 引入随机性
         output_dir: str = "./eval_results"
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
         seed: int = 42
         verbose: bool = True  # 是否显示 VLA 推理输出
+        num_workers: int | None = None  # 多 GPU 时最大 worker 数（默认自动检测 GPU 数）
 
     tyro.extras.set_accent_color("cyan")
     cfg = tyro.cli(EvalConfig)
@@ -318,8 +437,10 @@ if __name__ == "__main__":
         num_episodes=cfg.num_episodes,
         max_steps=cfg.max_steps,
         max_new_tokens=cfg.max_new_tokens,
+        temperature=cfg.temperature,
         output_dir=cfg.output_dir,
         device=cfg.device,
         seed=cfg.seed,
         verbose=cfg.verbose,
+        num_workers=cfg.num_workers,
     )

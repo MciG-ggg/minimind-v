@@ -2,8 +2,13 @@
 LIBERO 数据集预览与 VLA0 格式转换
 """
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+
+# vla_scripts 目录加入 sys.path（使 rich_helpers 可直接导入）
+sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
 import tyro
@@ -47,19 +52,45 @@ def normalize_action(
 def convert_sample(sample: dict) -> dict:
     _, language = TASK_MAP.get(sample["task_index"], (None, f"Task {sample['task_index']}"))
     norm = normalize_action(sample["action"])
-    # 【修复 BPE tokenization 与 action token 不匹配问题】
-    # 旧格式: "25 864 20 25 26 1713 4794" → BPE digit-by-digit split，模型学会单 digit 输出
-    # 新格式: "025x864x020x025x026x713x494" → 3-digit zero-padded + x 分隔，
-    #   每个 action value = 3 digits + 1 separator (x) = 4 tokens，7 actions = 28 tokens
-    #   x 是 tokenizer 的单 token (ID=90)，digit 是单 token (0-9 → IDs 18-27)
-    # 推理时 decode → regex 提取 3-digit groups → 正确还原 action tokens
-    action_str = "x".join(f"{int(a):03d}" for a in norm)
+    # 【方案 A 核心】动作文本格式：21 个数字拼接（无分隔符）
+    # 每个动作值归一化到 0-999 后转为 3 位字符串，全部拼接。
+    # 例: norm=[25,864,20,25,26,713,494] → "025864020025026713494"
+    # 推理时：逐位提取 digit (int(c) for c in text if c.isdigit())，
+    # 每 3 个相邻 digit 合并为 1 个 bin 值 (000-999)。
+    # 优势：每个 digit 在 tokenizer 下是独立 token（0-9 对应 IDs 18-27），
+    # 模型只需逐位预测 21 个 digit，vs 原来需要预测 17 个 sub-token。
+    action_str = "".join(f"{int(a):03d}" for a in norm)
     # 保留双视角图像：主视角 + 腕部视角（训练时在 DataCollator 中拼接为 6 通道）
-    return {
+    result = {
         "input_text": f"Instruction: {language}\nAction:",
         "action_text": action_str,
         "images": [sample["observation.images.image"], sample["observation.images.image2"]],
+        "_orig_task_index": sample["task_index"],  # 保留原始 task_index（转换后被移除）
     }
+    return result
+
+
+def convert_sample_batch(batch: dict) -> dict:
+    """批处理版本的 convert_sample。接收 batch dict of lists，返回 dict of lists。
+    相比逐样本 map（约 10 examples/s），批量 + 多进程可提升 ~10x 达到 100+ examples/s。
+    """
+    n = len(batch["task_index"])
+    results = {
+        "input_text": [],
+        "action_text": [],
+        "images": [],
+        "_orig_task_index": [],
+    }
+    for i in range(n):
+        task_index = batch["task_index"][i]
+        _, language = TASK_MAP.get(task_index, (None, f"Task {task_index}"))
+        norm = normalize_action(batch["action"][i])
+        action_str = "".join(f"{int(a):03d}" for a in norm)
+        results["input_text"].append(f"Instruction: {language}\nAction:")
+        results["action_text"].append(action_str)
+        results["images"].append([batch["observation.images.image"][i], batch["observation.images.image2"][i]])
+        results["_orig_task_index"].append(task_index)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +144,12 @@ def show_raw_samples(dataset: Dataset, n: int = 3) -> None:
 # 子命令
 # ---------------------------------------------------------------------------
 
-DEFAULT_OUTPUT_DIR = str(Path(__file__).parent.parent / "vla0_libero_object_train")
+DEFAULT_OUTPUT_DIR = str(Path(__file__).parent.parent / "vla0_libero_object_train")  # TODO: rename to vla0_libero_object_train / vla0_libero_multi 等
+
+# 默认转换 libero_object 的 10 个任务（task_index 10-19），
+# 与 eval_libero.py 默认评测的 LIBERO_OBJECT benchmark 对齐。
+# 使用 "10-19" 表示从 task_index 10 到 19（含）的所有任务。
+DEFAULT_TASK_INDEX = "10-19"
 
 
 @dataclass
@@ -121,12 +157,9 @@ class Show:
     """预览原始 + 转换后数据集样本"""
 
     n: int = 3
-    converted_path: str = ""
+    converted_path: str = DEFAULT_OUTPUT_DIR
 
     def run(self) -> None:
-        if not self.converted_path:
-            self.converted_path = DEFAULT_OUTPUT_DIR
-
         section("加载原始数据集", "cyan")
         dataset = load_dataset("HuggingFaceVLA/libero", "default", split="train")
         ok(f"加载完成: {len(dataset):,} 条\n")
@@ -167,14 +200,40 @@ class Show:
 
 @dataclass
 class Convert:
-    """执行完整转换流程"""
+    """执行完整转换流程
+
+    task_index: 支持单值 (如 0)、逗号列表 (如 10,11,12) 或范围 (如 10-19)。
+    范围格式: "start-end"，如 "10-19" 表示 task_index 10 到 19（含）。
+    """
 
     output: str = ""
-    task_index: int = 0
+    task_index: str = DEFAULT_TASK_INDEX
+
+    def _parse_task_indices(self) -> list[int]:
+        """解析 task_index 参数，支持多种格式"""
+        indices: list[int] = []
+        parts = self.task_index.split(",")
+        for part in parts:
+            part = part.strip()
+            if "-" in part and not part.startswith("-"):
+                # 范围格式: "10-19"
+                start_str, end_str = part.split("-", 1)
+                start, end = int(start_str), int(end_str)
+                indices.extend(range(start, end + 1))
+            else:
+                # 单值格式: "0" 或 "-5"（负数表示相对末尾）
+                idx = int(part)
+                if idx < 0:
+                    # 负数索引：相对于 TASK_MAP 的末尾
+                    idx = len(TASK_MAP) + idx
+                indices.append(idx)
+        return sorted(set(indices))
 
     def run(self) -> None:
         if not self.output:
             self.output = DEFAULT_OUTPUT_DIR
+
+        task_indices = self._parse_task_indices()
 
         section("加载数据集", "cyan")
         dataset = load_dataset("HuggingFaceVLA/libero", "default", split="train")
@@ -185,18 +244,40 @@ class Convert:
             ("配置 / 划分", "default / train"),
             ("原始样本总数", f"{len(dataset):,}"),
             ("task_index 映射范围", f"0 – {len(TASK_MAP) - 1}  ({len(TASK_MAP)} tasks)"),
-            ("过滤条件", f"task_index == {self.task_index}"),
+            ("过滤条件", f"task_index in {task_indices}  ({len(task_indices)} tasks)"),
         ])
         console.print()
 
-        filtered = dataset.filter(lambda x: x["task_index"] == self.task_index)
+        # 打印任务覆盖概览
+        section("任务覆盖", "yellow")
+        for ti in task_indices:
+            name, lang = TASK_MAP.get(ti, ("?", "???"))
+            print(f"  [{ti:2d}] {name:16s} | {lang[:60]}")
+        console.print()
+
+        filtered = dataset.filter(
+            lambda x: x["task_index"] in task_indices,
+            num_proc=16,
+            desc="过滤中",
+        )
         if len(filtered) == 0:
-            fatal(f"task_index={self.task_index} 没有样本，请先运行 show 查看可用分布")
+            fatal(f"task_index={task_indices} 没有样本，请先运行 show 查看可用分布")
         ok(f"过滤后: {len(filtered):,} 条\n")
 
         section("格式转换 (VLA0)", "cyan")
-        converted = filtered.map(convert_sample, remove_columns=filtered.column_names, desc="转换中")
+        converted = filtered.map(
+            convert_sample_batch,
+            batched=True,
+            batch_size=1000,
+            num_proc=16,
+            remove_columns=filtered.column_names,
+            desc="转换中",
+        )
         ok(f"转换完成: {len(converted):,} 条\n")
+
+        # 统计每个任务的样本数（Counter 替代循环，约 10x 加速）
+        task_counts: Counter = Counter(s["_orig_task_index"] for s in converted)
+        kv_table("各任务样本数", [(f"task_index={ti}", f"{task_counts.get(ti, 0):,} 条") for ti in task_indices])
 
         section("保存到磁盘", "cyan")
         converted.save_to_disk(self.output)
@@ -210,7 +291,7 @@ class All:
     """预览 + 转换"""
 
     output: str = ""
-    task_index: int = 0
+    task_index: str = DEFAULT_TASK_INDEX
     n: int = 3
 
     def run(self) -> None:

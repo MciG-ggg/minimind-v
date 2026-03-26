@@ -268,10 +268,20 @@ def normalize_action(action, action_min, action_max, num_bins=1000):
 
 | 数据集 | 描述 | 链接 |
 |--------|------|------|
-| LIBERO | 4 个场景共 480 个任务，6400 条轨迹 | [link](https://libero-project.github.io/) |
+| HuggingFaceVLA/libero | 4 个 benchmark 共 40 任务，273K 样本（`HuggingFaceVLA/libero` default split） | [link](https://huggingface.co/datasets/HuggingFaceVLA/libero) |
 | RT-1 | 130K 机器人演示数据 | [link](https://robotics-transformer.github.io/) |
 | ManiSkill2 | SAPIEN 模拟器的 2000+ 任务 | [link](https://github.com/haosulab/ManiSkill2) |
 | BridgeData | 多机器人多场景跨域数据 | [link](https://bridge-data.github.io/) |
+
+> **重要：HuggingFaceVLA/libero 的 task_index 映射（HuggingFaceVLA/libero::default 包含所有 4 个 benchmark）：**
+> - `task_index 0-9`:   `libero_spatial`（10 任务，如 "pick up the black bowl..."）
+> - `task_index 10-19`: `libero_object`（10 任务，如 "pick up the alphabet soup..."）
+> - `task_index 20-29`: `libero_goal`（10 任务）
+> - `task_index 30-39`: `libero_10`（10 任务）
+>
+> **训练与评测必须对齐！** `eval_libero.py` 默认评测 `LIBERO_OBJECT`，对应 `task_index 10-19`。
+> 必须用 `prepare_data.py --task_index 10-19` 生成训练数据（默认已设置）。
+> 如果训练用 `task_index=0`（libero_spatial）而评测用 `LIBERO_OBJECT`，任务完全不同，成功率必然为 0%。
 
 ### 3.4 VLA 数据集构建脚本
 

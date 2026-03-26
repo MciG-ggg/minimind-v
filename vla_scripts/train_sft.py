@@ -24,14 +24,17 @@ from transformers import (
 )
 from transformers.data.data_collator import DataCollatorWithPadding
 
-# rich_helpers 和本脚本同目录
-sys.path.insert(0, str(Path(__file__).parent))
-from rich_helpers import ok, warn, info, section, kv_table, console
+# 项目根目录加入 sys.path（使 vla_scripts 成为可导入的包）
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from vla_scripts.rich_helpers import ok, warn, info, section, kv_table, console
 
 import tyro
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "model"))
-from model_vla import load_vla_model, SYSTEM_PROMPT
+from model_vla import load_vla_model
+
+# 【方案 A】训练和推理均不使用 SYSTEM_PROMPT，避免引入未见过的 token
+SYSTEM_PROMPT = ""
 
 # ==============================================================================
 # DataCollator
@@ -90,12 +93,9 @@ class VLADataCollator(DataCollatorWithPadding):
             wrist_imgs.append(self._preprocess_image(img_list[1]))   # [3, 224, 224]
         front_stack = torch.stack(front_imgs, dim=0)   # [B, 3, 224, 224]
         wrist_stack = torch.stack(wrist_imgs, dim=0)   # [B, 3, 224, 224]
-        # 【双图支持】images 是 list of 2 PIL.Image（主视角 + 腕部视角）
         # 始终输出 [B, 2, 3, H, W]，由模型根据 dual_image 参数决定：
         # - dual_image=True:  用 ImageFusionModule 融合
         # - dual_image=False: 在模型内部平均两个图像 embedding
-        front_stack = torch.stack(front_imgs, dim=0)   # [B, 3, 224, 224]
-        wrist_stack = torch.stack(wrist_imgs, dim=0)   # [B, 3, 224, 224]
         pixel_values = torch.stack([front_stack, wrist_stack], dim=1)  # [B, 2, 3, 224, 224]
 
         # --- 文本 tokenize: MiniMind tokenizer ---
@@ -105,7 +105,7 @@ class VLADataCollator(DataCollatorWithPadding):
             dtype=torch.long,
         )
 
-        text_with_prompt = [f"{self.system_prompt}\n\n{t}" for t in input_texts]
+        text_with_prompt = [f"{self.system_prompt}{t}" for t in input_texts]
         text_ids = self._tokenizer(
             text_with_prompt,
             add_special_tokens=False,
@@ -159,9 +159,11 @@ class SFTConfig:
     # 继续微调（基于已有 VLA）→ 填训练输出的 checkpoint（如 "./checkpoints/final"）
     model_path_or_id: str = "jingyaogong/minimind2-v"
     dual_image: bool = True   # 启用双视角图像融合（主视角 + 腕部视角）
+    # 数据集路径：对齐 eval_libero.py 评测的 LIBERO_OBJECT benchmark（task_index 10-19）
+    # 使用 prepare_data.py 的 task_index="10-19" 生成
     dataset_path: str = "./vla0_libero_object_train"
     output_dir: str = "./checkpoints"
-    epochs: int = 5          # 加大 epochs，3 epochs 不充分
+    epochs: int = 10         # 方案 A 新格式：增加到 10 epochs，loss 仍在下降
     batch_size: int = 4
     lr_llm: float = 5e-6      # LLM 学习率（预训练权重，需较小 LR 保持泛化）
     lr_vision: float = 5e-5   # VisionProj 学习率（少量参数，可适当放大）

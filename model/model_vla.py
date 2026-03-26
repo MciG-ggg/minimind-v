@@ -1,14 +1,8 @@
 """
 MiniMind-V VLA 推理封装
 
-抽象出 VLAModel 类，封装:
-- 模型加载 (checkpoint → MiniMindVLM + CLIPProcessor)
-- 输入预处理 (instruction + PIL.Image → input_ids + pixel_values)
-- forward / generate
-- 动作 token 提取 + 反归一化
-
 用法:
-    vla = VLAModel("./checkpoints/final", device="cuda")  # 加载本地 VLA checkpoint
+    vla = VLAModel("./checkpoints/final", device="cuda")
     action = vla.predict("pick up the object", image_pil)  # → torch.Tensor (7,)
 """
 
@@ -23,36 +17,57 @@ from transformers import AutoModelForCausalLM
 
 
 # ---------------------------------------------------------------------------
-# 动作离散化参数（与 prepare_data.py 保持一致）
+# 动作离散化参数
 # ---------------------------------------------------------------------------
 ACTION_TOKEN_MIN = 0
 ACTION_TOKEN_MAX = 999
 ACTION_LOW = -1.0
 ACTION_HIGH = 1.0
 ACTION_DIM = 7
+BINS_PER_ACTION = 3
+# 生成 token 总数（每个 action 值 3 位 + 空格分隔）
+MAX_GENERATION_TOKENS = ACTION_DIM * BINS_PER_ACTION + ACTION_DIM - 1
+# Fallback bin=500（中间值）用于异常情况
+_FALLBACK_DIGITS = [5, 0, 0] * ACTION_DIM
 
 
 def denormalize_action(token_ids):
-    """离散动作 token → 连续动作，始终返回 2D 数组 (N, ACTION_DIM)"""
+    """离散动作 token → 连续动作，始终返回 2D 数组 (N, ACTION_DIM)
+
+    输入格式：纯数字字符列表（ACTION_DIM * BINS_PER_ACTION 个 0-9 整数）。
+    将每 BINS_PER_ACTION=3 个相邻数字合并为 1 个 bin 值 (0-999)，再反归一化。
+    """
     import numpy as np
     tokens = np.array(token_ids).flatten()
-    num_actions = len(tokens) // ACTION_DIM
-    tokens = tokens[: num_actions * ACTION_DIM]
-    normalized = (tokens - ACTION_TOKEN_MIN) / (ACTION_TOKEN_MAX - ACTION_TOKEN_MIN)
-    # 始终 reshape 成 (N, 7)，确保上游 actions[0] 索引行为一致
-    continuous = (normalized * (ACTION_HIGH - ACTION_LOW) + ACTION_LOW)
+
+    if len(tokens) == 0:
+        tokens = np.zeros(ACTION_DIM * BINS_PER_ACTION, dtype=int)
+
+    num_complete_bins = len(tokens) // BINS_PER_ACTION
+    remainder = len(tokens) % BINS_PER_ACTION
+
+    bin_values = []
+    for i in range(num_complete_bins):
+        chunk = tokens[i * BINS_PER_ACTION:(i + 1) * BINS_PER_ACTION]
+        bin_val = sum(d * (10 ** (BINS_PER_ACTION - 1 - j)) for j, d in enumerate(chunk))
+        bin_values.append(bin_val)
+
+    if remainder > 0:
+        tail = tokens[num_complete_bins * BINS_PER_ACTION:]
+        pad = [tail[-1]] * (BINS_PER_ACTION - remainder)
+        chunk = np.concatenate([tail, pad])
+        bin_val = sum(d * (10 ** (BINS_PER_ACTION - 1 - j)) for j, d in enumerate(chunk))
+        bin_values.append(bin_val)
+
+    if len(bin_values) == 0:
+        bin_values = [0]
+    while len(bin_values) < ACTION_DIM:
+        bin_values.append(bin_values[-1])
+
+    bin_values = np.array(bin_values[:ACTION_DIM], dtype=np.float64)
+    normalized = (bin_values - ACTION_TOKEN_MIN) / (ACTION_TOKEN_MAX - ACTION_TOKEN_MIN)
+    continuous = normalized * (ACTION_HIGH - ACTION_LOW) + ACTION_LOW
     return continuous.reshape(-1, ACTION_DIM)
-
-
-# ---------------------------------------------------------------------------
-# System Prompt
-# ---------------------------------------------------------------------------
-SYSTEM_PROMPT = (
-    "System Prompt. Analyze the input image and predict robot actions "
-    "for the next H timesteps. Each action has D dimensions. Output a single "
-    "sequence of H × D integers (0 B each), representing the H timesteps "
-    "sequentially. Provide only space-separated numbers. Nothing else."
-)
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +105,6 @@ def load_vla_model(
         config = AutoConfig.from_pretrained(model_path_or_id, trust_remote_code=True)
         config.dual_image = True
         config.fusion_type = fusion_type
-        # 【修复】vision_model_path 使用绝对路径，避免相对路径在 HuggingFace cache 环境下解析错误
         vision_abs_path = str(Path(__file__).parent / "vision_model" / "clip-vit-base-patch16")
         config.vision_model_path = vision_abs_path
         model = AutoModelForCausalLM.from_pretrained(
@@ -99,7 +113,6 @@ def load_vla_model(
     else:
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(model_path_or_id, trust_remote_code=True)
-        # 【修复】vision_model_path 使用绝对路径
         vision_abs_path = str(Path(__file__).parent / "vision_model" / "clip-vit-base-patch16")
         config.vision_model_path = vision_abs_path
         model = AutoModelForCausalLM.from_pretrained(model_path_or_id, config=config, trust_remote_code=True)
@@ -116,21 +129,7 @@ def load_vla_model(
             "可能是非 VLA 模型"
         )
 
-    # =========================================================================
-    # 【核心修复】使用正确的 MiniMind Tokenizer（替换 CLIPProcessor 的 tokenizer）
-    #
-    # 问题：CLIPProcessor 的 tokenizer 有 49408 个 token（BOS=49406, EOS=49407），
-    #       产生的 text token ID 可达 37695+，远超模型 vocab_size=6400。
-    #       根本原因：模型训练时使用的是 MiniMind tokenizer（vocab=6400），
-    #       而推理时错误地使用了 CLIP tokenizer。
-    #
-    # 方案：加载与训练时一致的 MiniMind tokenizer（来自 model/tokenizer.json）
-    #       - vocab_size: 6400
-    #       - bos_token_id: 1 (<|im_start|>)
-    #       - eos_token_id: 2 (<|im_end|>)
-    #       - pad_token_id: 0 (<|endoftext|>)
-    #       CLIPProcessor 保留（模型内部 get_vision_model 仍需要它）。
-    # =========================================================================
+    # 使用 MiniMind tokenizer（vocab=6400）替代 CLIP tokenizer
     _model_dir = Path(model_path_or_id) if Path(model_path_or_id).is_dir() else Path("./checkpoints/final")
     _tokenizer_path = _model_dir / "tokenizer.json"
     if not _tokenizer_path.exists():
@@ -170,18 +169,18 @@ class VLAModel:
         self,
         model_path_or_id: str,
         device: str = "cuda",
-        max_new_tokens: int = 64,
+        max_new_tokens: int = MAX_GENERATION_TOKENS,
         do_sample: bool = False,
+        temperature: float = 0.3,
         dual_image: bool = False,
     ):
         self.model_path_or_id = model_path_or_id
         self.device = device
         self.max_new_tokens = max_new_tokens
         self.do_sample = do_sample
-        self.system_prompt = SYSTEM_PROMPT
+        self.temperature = temperature
         self.dual_image = dual_image
 
-        # 统一通过 load_vla_model 加载
         loaded = load_vla_model(model_path_or_id, device, eval_mode=True, dual_image=dual_image)
         self.model = loaded["model"]
         self.processor = loaded["processor"]
@@ -190,6 +189,11 @@ class VLAModel:
         self.bos_id = loaded["bos_id"]
         self.eos_id = loaded["eos_id"]
         self.pad_id = loaded["pad_id"]
+
+        # 预计算常量 tensor，避免 predict 每次重建
+        self._bos_tensor = torch.tensor([[self.bos_id]], device=device)
+        self._eos_tensor = torch.tensor([[self.eos_id]], device=device)
+        self._image_ids_tensor = torch.tensor([self.image_ids], device=device)
 
     # ------------------------------------------------------------------
     # 核心推理
@@ -203,62 +207,52 @@ class VLAModel:
         """
         给定指令 + 图像，返回连续动作向量
 
+        【方案 A】训练时用拼接格式 "025864020025026713494"，
+        推理时模型自由生成数字文本，regex 提取所有 digit，
+        每 3 个相邻 digit 合并为 1 个 bin 值 (0-999)，再反归一化。
+
         Args:
             instruction: 文本指令
-            image: 单张 PIL.Image（单图模式）或 list of 2 PIL.Image（双图模式：主视角 + 腕部视角）
+            image: 单张 PIL.Image 或 list of 2 PIL.Image（双图模式）
 
         Returns:
             torch.Tensor: shape (ACTION_DIM,), dtype float32, range [ACTION_LOW, ACTION_HIGH]
         """
         import numpy as np
-        import re
 
         inputs = self._build_inputs(instruction, image)
-        input_len = inputs["input_ids"].shape[1]
 
+        gen_kwargs = dict(
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.do_sample,
+            pad_token_id=self.pad_id,
+            eos_token_id=self.eos_id,
+        )
+        if self.do_sample and self.temperature > 0:
+            gen_kwargs["temperature"] = self.temperature
+            gen_kwargs["top_p"] = 0.9
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=self.do_sample,
-                pad_token_id=self.pad_id,
-                eos_token_id=self.eos_id,
-            )
+            outputs = self.model.generate(**inputs, **gen_kwargs)
 
-        # 【修复 BPE Tokenizer 与 Action Token 不匹配问题】
-        # 训练格式: action values → normalize → "025x864x020x025x026x713x494"
-        #   (3-digit zero-padded + x 分隔，每个 action = 3 digits + 1 separator)
-        # 推理时: model 输出 tokenizer vocab token IDs → decode → parse → action token IDs (0-999)
-        generated_text = self.tokenizer.decode(outputs[0, input_len:].tolist(), skip_special_tokens=True)
-        action_ids = re.findall(r"\d{3}", generated_text)
+        # 【方案 A】从生成文本中提取所有 digit（忽略空格和文字）
+        generated_text = self.tokenizer.decode(outputs[0].tolist(), skip_special_tokens=True)
+        all_digits = [int(c) for c in generated_text if c.isdigit()]
 
-        if len(action_ids) < ACTION_DIM:
-            # 极少情况：用 logits top-k 补齐
-            logits = self.model(**inputs).logits[0, -1, :]
-            logits_ids = torch.topk(logits, ACTION_DIM).indices.tolist()
-            action_ids = action_ids + logits_ids[len(action_ids):]
+        # 防御性：digit 不足 21 个时用 fallback 填充
+        if len(all_digits) < ACTION_DIM * BINS_PER_ACTION:
+            all_digits = _FALLBACK_DIGITS[:]
 
-        actions = denormalize_action(np.array([int(x) for x in action_ids[:ACTION_DIM]]))
-        # 防御性：确保 actions 是 2D (N, 7)，防止极端情况下 reshape 后变成 1D
+        actions = denormalize_action(np.array(all_digits))
         if actions.ndim == 1:
             actions = actions.reshape(1, -1)
-        action = torch.from_numpy(actions[0]).float()  # 提取第一行 → (7,)
-        return action
-
-    def forward(
-        self,
-        instruction: str,
-        image: "Image.Image | list[Image.Image]",
-    ) -> torch.Tensor:
-        """predict 的别名，保持接口一致性"""
-        return self.predict(instruction, image)
+        return torch.from_numpy(actions[0]).float()
 
     # ------------------------------------------------------------------
     # 内部实现
     # ------------------------------------------------------------------
 
     def _preprocess_image(self, img: Image.Image) -> torch.Tensor:
-        """单张 PIL.Image → [3, 224, 224] float32 normalized"""
+        """单张 PIL.Image → [3, 224, 224] float32 (CLIP normalize)"""
         import numpy as np
         img = img.resize((224, 224), Image.BICUBIC)
         if img.mode in ("RGBA", "LA"):
@@ -275,10 +269,8 @@ class VLAModel:
         instruction: str,
         image: "Image.Image | list[Image.Image]",
     ) -> dict[str, torch.Tensor]:
-        """构造 LLM 输入: input_ids + attention_mask + pixel_values"""
-        text = f"{self.system_prompt}\n\nInstruction: {instruction}\nAction:"
+        text = f"Instruction: {instruction}\nAction:"
 
-        # 1. 文本 tokenize（不含特殊 token，由我们手动插入 BOS/EOS）
         text_tokens = self.tokenizer(
             text,
             return_tensors="pt",
@@ -287,47 +279,27 @@ class VLAModel:
             add_special_tokens=False,
         )["input_ids"][0]
 
-        # 2. 构造完整 input_ids: BOS + image_ids + text_tokens + EOS
         input_ids = torch.cat(
             [
-                torch.tensor([[self.bos_id]]),
-                torch.tensor([self.image_ids]),
+                self._bos_tensor,
+                self._image_ids_tensor,
                 text_tokens.unsqueeze(0),
-                torch.tensor([[self.eos_id]]),
+                self._eos_tensor,
             ],
             dim=1,
         )
         attention_mask = torch.ones_like(input_ids)
 
-        # 3. 图像预处理
         if self.dual_image:
-            # 【双图像模式】image 是 list of 2 PIL.Image（主视角 + 腕部视角）
             front, wrist = image[0], image[1]
-            front_t = self._preprocess_image(front).unsqueeze(0)    # [1, 3, 224, 224]
-            wrist_t = self._preprocess_image(wrist).unsqueeze(0)    # [1, 3, 224, 224]
-            pixel_values = torch.stack([front_t, wrist_t], dim=1) # [1, 2, 3, 224, 224]
+            front_t = self._preprocess_image(front).unsqueeze(0)
+            wrist_t = self._preprocess_image(wrist).unsqueeze(0)
+            pixel_values = torch.stack([front_t, wrist_t], dim=1)
         else:
-            # 【单图像模式】
-            pixel_values = self._preprocess_image(image).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, 224, 224]
+            pixel_values = self._preprocess_image(image).unsqueeze(0).unsqueeze(0)
 
         return {
             "input_ids": input_ids.to(self.device),
             "attention_mask": attention_mask.to(self.device),
             "pixel_values": pixel_values.to(self.device),
         }
-
-    def _extract_action_tokens(
-        self, outputs: torch.Tensor, input_len: int
-    ) -> list[int]:
-        """
-        从 generate 输出中提取动作 token
-
-        输出序列 = [BOS, IMAGE*196, text_tokens, EOS, 生成_tokens...]
-        动作 token 从 text_tokens 结束后开始（跳过 input_len）
-        """
-        skip_ids = {self.pad_id, self.eos_id}
-        return [
-            t.item()
-            for t in outputs[0, input_len:]
-            if t.item() not in skip_ids
-        ]
