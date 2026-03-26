@@ -1,380 +1,255 @@
 """
 MiniMind-V 在 LIBERO 仿真环境上的评估脚本。
 支持对 SFT 后的 VLA checkpoint 进行 rollout 评测。
-
-用法:
-    # 评测指定 checkpoint（默认取 final）
-    python vla-scripts/eval_libero.py \
-        --checkpoint ./checkpoints/final \
-        --model_id jingyaogong/minimind2-v \
-        --num_episodes 10
-
-    # 评测训练中途的 checkpoint
-    python vla-scripts/eval_libero.py \
-        --checkpoint ./checkpoints/checkpoint-500 \
-        --num_episodes 10
-
-    # 批量评测多个 checkpoint
-    python vla-scripts/eval_libero.py \
-        --checkpoint ./checkpoints \
-        --num_episodes 10
 """
 
-import os
-import time
 import json
-import numpy as np
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Tuple
+import os
+import sys
+import time
 from pathlib import Path
 
+# 必须在导入 mujoco/libero 之前设置，以避免 EGL 初始化错误
+os.environ.setdefault("MUJOCO_GL", "osmesa")
+
+import imageio
+import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoProcessor
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.table import Table
+
+# rich_helpers 和本脚本同目录，动态加路径确保 import 可靠
+# 项目根目录 (含 model/) 也加入路径以便 from model.model_vla import VLAModel
+_script_dir = Path(__file__).parent
+_root_dir = _script_dir.parent
+sys.path.insert(0, str(_script_dir))
+sys.path.insert(0, str(_root_dir))
+from rich_helpers import ok, warn, err, fatal, section, kv_table, console
 
 import tyro
-from libero.libero.envs import OffScreenRenderEnv
 from libero.libero.benchmark import get_benchmark
+from libero.libero.envs import OffScreenRenderEnv
 
-# ==============================================================================
-# 1. 动作 token ↔ 连续动作 的转换
-# ==============================================================================
+# 预设置 LIBERO 资产路径缓存，避免每次自动尝试从 HuggingFace 下载
+import libero.libero
+_libero_pkg_dir = Path(libero.libero.__file__).parent
+_libero_assets_dir = _libero_pkg_dir / "assets"
+if _libero_assets_dir.exists():
+    libero.libero._assets_path_cache = str(_libero_assets_dir)
 
-# 需与 prepare_data.py 中的 normalize_action 保持一致
-ACTION_TOKEN_MIN = 0
-ACTION_TOKEN_MAX = 999
-ACTION_LOW = -1.0
-ACTION_HIGH = 1.0
-ACTION_DIM = 7  # LIBERO 默认 7DoF
-
-
-def denormalize_action(token_ids: np.ndarray) -> np.ndarray:
-    """
-    将模型输出的 token ID 序列反归一化为连续的 action 值。
-    输入: 展平的 token ID 数组 (N,)
-    输出: 连续动作数组  (N, 7)
-    """
-    # 每个 action 维度对应一个 token
-    tokens = np.array(token_ids).flatten()
-    num_actions = len(tokens) // ACTION_DIM
-    tokens = tokens[: num_actions * ACTION_DIM]
-
-    normalized = (tokens - ACTION_TOKEN_MIN) / (ACTION_TOKEN_MAX - ACTION_TOKEN_MIN)
-    actions = normalized * (ACTION_HIGH - ACTION_LOW) + ACTION_LOW
-    return actions.reshape(-1, ACTION_DIM)
-
-
-def greedy_decode_action_tokens(
-    logits: torch.Tensor,
-    input_len: int,
-    stop_token_id: int,
-    max_len: int = 70,
-) -> List[int]:
-    """
-    从 logits 中贪心解码动作 token 序列。
-
-    Args:
-        logits: 模型输出 logits，shape (1, seq_len, vocab_size)
-        input_len: 输入 prompt 的长度，解码时跳过
-        stop_token_id: 停止 token ID（超过此长度截断）
-        max_len: 最大解码动作 token 数
-
-    Returns:
-        解码出的动作 token ID 列表
-    """
-    # 取最后一个位置的 logits（自回归生成）
-    logits = logits[0, -1, :]  # (vocab_size,)
-    probs = torch.softmax(logits, dim=-1)
-    next_token = torch.argmax(probs, dim=-1).item()
-
-    tokens = []
-    vocab_size = logits.shape[-1]
-
-    # 简单的 greedy 解码，最多 max_len 步
-    for _ in range(max_len):
-        if next_token == stop_token_id:
-            break
-        tokens.append(next_token)
-        # 重新索引（实际使用时需要重新过模型，这里简化为贪婪）
-        # 完整实现需要重新过模型，但此处假设 logits 已足够
-        if len(tokens) >= max_len:
-            break
-        # 对于 VLA 的单步评估，这里直接返回贪婪的第一个 token
-        # 真实 rollout 需要自回归，这里返回 (ACTION_DIM,) 个 token
-        break  # 单步贪婪
-
-    # 如果 tokens 为空，用贪婪采样得到 ACTION_DIM 个 token
-    if not tokens:
-        top_tokens = torch.topk(probs, ACTION_DIM).indices.tolist()
-        tokens = top_tokens
-
-    return tokens
+# VLA 推理封装
+from model.model_vla import VLAModel
 
 
 # ==============================================================================
-# 2. VLA 推理核心
+# 辅助函数
 # ==============================================================================
 
-def load_vla_model_and_processor(
-    checkpoint_path: str,
-    base_model_id: str = "jingyaogong/minimind2-v",
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> Tuple[Any, Any]:
-    """
-    加载 SFT 后的 VLA 模型和 processor。
-    优先从 checkpoint 加载；若 checkpoint 不存在则从 base_model_id 加载。
-    """
-    if os.path.isdir(checkpoint_path):
-        # 尝试 transformers 格式
-        config_file = Path(checkpoint_path) / "config.json"
-        if config_file.exists():
-            model = AutoModelForCausalLM.from_pretrained(checkpoint_path, trust_remote_code=True)
-            processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
-        else:
-            # 原生 torch 格式（需要额外处理）
-            print(f"[Warning] checkpoint {checkpoint_path} 不是 transformers 格式，尝试从 {base_model_id} 加载基础模型...")
-            model = AutoModelForCausalLM.from_pretrained(base_model_id, trust_remote_code=True)
-            processor = AutoProcessor.from_pretrained(base_model_id, trust_remote_code=True)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(checkpoint_path, trust_remote_code=True)
-        processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
-
-    model = model.to(device).eval()
-    return model, processor
+def _flip_frame(frame: np.ndarray) -> np.ndarray:
+    """翻转帧以修正 MuJoCo offscreen 渲染的坐标系（原点左下→左上）"""
+    return np.flipud(frame)
 
 
-def predict_action(
-    model,
-    processor,
-    instruction: str,
-    image: Image.Image,
-    device: str = "cuda",
-    max_new_tokens: int = 32,
-) -> np.ndarray:
-    """
-    给定一条指令 + 图像，VLA 模型输出动作。
+def generate_markdown_report(summary: dict, output_dir: str, cfg) -> str:
+    """生成 markdown 格式的评测报告，返回报告文件路径"""
+    md_lines = []
+    md_lines.append("# LIBERO 评测报告\n")
 
-    注意: 这里的实现假设模型已被 SFT 微调，
-    输入格式与 train_sft.py 中保持一致。
-    """
-    # --- 构建 prompt（与训练时一致） ---
-    input_text = f"Instruction: {instruction}\nAction:"
+    # 评测配置
+    md_lines.append("## 评测配置\n")
+    md_lines.append("| 配置项 | 值 |")
+    md_lines.append("|--------|-----|")
+    md_lines.append(f"| Task Suite | {summary['task_suite']} |")
+    md_lines.append(f"| Checkpoint | `{summary['checkpoint']}` |")
+    md_lines.append(f"| 评测任务数 | {summary['num_tasks_evaluated']} |")
+    md_lines.append(f"| 最大步数 | {cfg.max_steps} |")
+    md_lines.append(f"| 种子 | {cfg.seed} |")
+    md_lines.append(f"| Device | {cfg.device} |")
+    md_lines.append(f"| Max New Tokens | {cfg.max_new_tokens} |")
+    md_lines.append("")
 
-    # --- 处理图像 ---
-    inputs = processor(
-        text=[input_text],
-        images=[[image]],  # processor 期望 list of list of images
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    )
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
-    pixel_values = inputs["pixel_values"].to(device)
+    # 总体结果
+    md_lines.append("## 总体结果\n")
+    md_lines.append("| 指标 | 值 |")
+    md_lines.append("|------|-----|")
+    md_lines.append(f"| 成功数 | {summary['success_count']} / {summary['num_tasks_evaluated']} |")
+    md_lines.append(f"| **成功率** | **{summary['success_rate']}** |")
+    md_lines.append(f"| 平均奖励 | {summary['mean_episode_return']} |")
+    md_lines.append(f"| 平均步数 | {summary['mean_episode_len']} |")
+    md_lines.append("")
 
-    # --- 获取输入长度（用于分离 prompt 和 action tokens） ---
-    input_len = input_ids.shape[1]
-
-    # --- 生成动作 token ---
-    with torch.no_grad():
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # 评估时用贪婪
-            pad_token_id=processor.tokenizer.pad_token_id or 0,
-            eos_token_id=processor.tokenizer.eos_token_id,
+    # 各任务详细结果
+    md_lines.append("## 各任务详细结果\n")
+    md_lines.append("| # | 任务指令 | 状态 | 奖励 | 步数 | 耗时 |")
+    md_lines.append("|---|---------|------|------|------|------|")
+    for r in summary["per_task_results"]:
+        status = "✅" if r["success"] else "❌"
+        instruction = r["instruction"]
+        if len(instruction) > 40:
+            instruction = instruction[:40] + "..."
+        md_lines.append(
+            f"| {r['task_idx']:02d} | {instruction} | {status} | "
+            f"{r['episode_return']:.3f} | {r['episode_len']} | {r['elapsed_s']:.1f}s |"
         )
+    md_lines.append("")
 
-    # --- 提取动作部分的 token ---
-    action_tokens = outputs[0, input_len:].cpu().tolist()
+    # 写入文件
+    report_path = os.path.join(output_dir, "report.md")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines))
 
-    # --- 过滤掉 padding / eos token ---
-    pad_id = processor.tokenizer.pad_token_id or 0
-    eos_id = processor.tokenizer.eos_token_id
-    action_tokens = [t for t in action_tokens if t not in (pad_id, eos_id)]
-
-    # --- 反归一化 ---
-    if len(action_tokens) == 0:
-        # fallback: 用 top-1 贪婪
-        with torch.no_grad():
-            logits = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-            ).logits
-        last_logits = logits[0, -1, :]
-        top_tokens = torch.topk(last_logits, ACTION_DIM).indices.tolist()
-        action_tokens = top_tokens
-
-    actions = denormalize_action(np.array(action_tokens))
-    # 取第一个动作
-    action = actions[0] if len(actions) > 0 else np.zeros(ACTION_DIM)
-    return action
+    return report_path
 
 
 # ==============================================================================
-# 3. LIBERO 环境交互
+# 评测流程
 # ==============================================================================
 
-def make_libero_env(task_suite_name: str = "LIBERO_OBJECT") -> OffScreenRenderEnv:
-    """
-    创建 LIBERO 仿真环境。
-    task_suite_name 可选: LIBERO_OBJECT, LIBERO_SPATIAL, LIBERO_GROUND, LIBERO_TOOL_USE, LIBERO_MULTI
-    """
-    benchmark = get_benchmark(task_suite_name)()
-    env = benchmark.get_task_envs()[0]  # 取第一个环境做评测
-    return env
-
-
-def evaluate_single_task(
-    model,
-    processor,
-    env: OffScreenRenderEnv,
-    instruction: str,
-    device: str = "cuda",
-    max_steps: int = 400,
-    render_freq: int = 0,  # >0 时保存渲染图像
-    save_dir: str = "./eval_frames",
-) -> Dict[str, Any]:
-    """
-    在单个 LIBERO 任务上执行一个 episode。
-
-    Returns:
-        dict: 包含 success (bool), episode_return (float), episode_len (int)
-    """
+def evaluate_task(vla: VLAModel, env: OffScreenRenderEnv, instruction: str, max_steps: int, save_dir: str, fps: int = 30, verbose: bool = True) -> dict:
+    """在单个任务上执行一个 episode，可选保存帧图像和视频"""
     obs = env.reset()
     episode_return = 0.0
     episode_len = 0
     done = False
     success = False
+    frames = []
 
-    info = {"observations": [], "actions": [], "rewards": []}
+    # 打印任务指令
+    if verbose:
+        section(f"任务指令: {instruction}", "yellow")
+        console.print()
 
     for step in range(max_steps):
-        # 获取当前图像观测
-        rgb_obs = obs["agentview_image"]  # HWC, uint8
-        image = Image.fromarray(rgb_obs)
+        rgb = obs["agentview_image"]
+        wrist_rgb = obs["robot0_eye_in_hand_image"]
 
-        # VLA 推理
-        action = predict_action(
-            model, processor, instruction, image, device=device
-        )
+        # VLA 推理（双图像模式：主视角 + 腕部视角）
+        front_img = Image.fromarray(rgb)
+        wrist_img = Image.fromarray(wrist_rgb)
+        action_tensor = vla.predict(instruction, [front_img, wrist_img])
+        action = action_tensor.cpu().numpy()
+        # 防御性：确保 action 是 1D (7,) 而非 (1, 7) 或其他形状
+        if action.ndim > 1:
+            action = action.squeeze()
 
-        # 执行动作
+        # 调试输出：显示 VLA 推理结果
+        if verbose:
+            console.print(f"[dim]Step {step:3d}[/dim] | Action: {action.round(3)}")
+
         obs, reward, done, info_ = env.step(action)
         episode_return += reward
         episode_len += 1
 
-        if render_freq > 0 and step % render_freq == 0:
-            img_path = os.path.join(save_dir, f"step_{step:04d}.png")
-            os.makedirs(os.path.dirname(img_path), exist_ok=True)
-            Image.fromarray(rgb_obs).save(img_path)
+        # 采集帧（所有帧用于合成视频，按需保存 PNG）
+        if save_dir:
+            frames.append(_flip_frame(rgb))
+            if step % 50 == 0:
+                p = Path(save_dir) / f"step_{step:04d}.png"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(_flip_frame(rgb)).save(p)
 
         if done or info_.get("success", False):
             success = info_.get("success", False)
             break
 
-    return {
-        "success": success,
-        "episode_return": episode_return,
-        "episode_len": episode_len,
-    }
+    # 保存视频（帧已在采集时翻转，直接写入）
+    if save_dir and frames:
+        video_path = Path(save_dir) / "rollout.mp4"
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        with imageio.get_writer(video_path, fps=fps, codec="libx264", pixelformat="yuv420p") as writer:
+            for frame in frames:
+                writer.append_data(frame)
+        warn(f"视频已保存: {video_path}")
+
+    return {"success": success, "episode_return": episode_return, "episode_len": episode_len}
 
 
-# ==============================================================================
-# 4. 主评测流程
-# ==============================================================================
+def run_eval(checkpoint: str, model_id: str, task_suite: str, num_episodes: int,
+             max_steps: int, max_new_tokens: int, output_dir: str, device: str,
+             seed: int, verbose: bool = True) -> dict:
 
-@dataclass
-class EvalConfig:
-    # 模型
-    checkpoint: str = "./checkpoints/final"  # SFT 输出的 checkpoint 路径
-    model_id: str = "jingyaogong/minimind2-v"  # 基础模型 ID（当 checkpoint 不含完整配置时用）
+    # 种子
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 加载 VLA 模型
+    section("加载 VLA 模型", "cyan")
+    vla = VLAModel(checkpoint, device=device, dual_image=True, max_new_tokens=max_new_tokens)
+    ok(f"模型已加载到 {device}")
+    kv_table("模型信息", [
+        ("checkpoint", checkpoint),
+        ("device", device),
+        ("processor", vla.processor.__class__.__name__),
+        ("max_new_tokens", str(max_new_tokens)),
+    ])
+    console.print()
 
     # 环境
-    task_suite: str = "LIBERO_OBJECT"  # LIBERO_OBJECT | LIBERO_SPATIAL | LIBERO_GROUND | LIBERO_TOOL_USE | LIBERO_MULTI
-    num_episodes: int = 10  # 每个任务评测多少个 episode（LIBERO 每个任务只有 1 个初始状态）
-    max_steps: int = 400  # 每个 episode 最大步数
-    render_freq: int = 0  # 每隔多少步保存一帧图像（0=不保存）
+    section("创建 LIBERO 环境", "cyan")
+    benchmark = get_benchmark(task_suite)()
+    tasks = benchmark.tasks
+    ok(f"Suite: {task_suite}, 共 {len(tasks)} 个任务，评测前 {num_episodes} 个")
+    console.print()
 
-    # 输出
-    output_dir: str = "./eval_results"
-    save_trajectories: bool = False  # 是否保存每条 trajectory 的详细数据
-
-    # 运行时
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    seed: int = 42
-    verbose: int = 1
-
-
-def main(cfg: EvalConfig):
-    os.makedirs(cfg.output_dir, exist_ok=True)
-
-    # --- 固定随机种子 ---
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.seed)
-
-    # --- 加载模型 ---
-    print(f"\n{'='*60}")
-    print(f"加载 VLA 模型: {cfg.checkpoint}")
-    model, processor = load_vla_model_and_processor(
-        cfg.checkpoint, cfg.model_id, cfg.device
-    )
-    print(f"模型已加载到 {cfg.device}")
-    print(f"{'='*60}\n")
-
-    # --- 创建 LIBERO 环境 ---
-    print(f"创建 LIBERO 环境: {cfg.task_suite}")
-    benchmark = get_benchmark(cfg.task_suite)()
-    task_envs = benchmark.get_task_envs()
-    print(f"该 suite 共 {len(task_envs)} 个任务，评测前 {cfg.num_episodes} 个")
-    print(f"{'='*60}\n")
-
-    # --- 逐任务评测 ---
+    # 逐任务评测 + 实时表格
     results = []
-    for task_idx, task_env in enumerate(task_envs[:cfg.num_episodes]):
-        instruction = task_env.task_instruction
+    task_table = Table(title="评测进度", box=None)
+    task_table.add_column("#", style="cyan", justify="right", width=3)
+    task_table.add_column("任务指令 (截断)", style="white")
+    task_table.add_column("结果", style="green", width=10)
+    task_table.add_column("奖励", style="magenta", width=8)
+    task_table.add_column("步数", style="yellow", width=5)
+    task_table.add_column("耗时", style="dim", width=6)
 
-        if cfg.verbose:
-            print(f"[Task {task_idx:02d}] {instruction[:80]}...")
+    section("开始评测", "cyan")
+    for task_idx, task in enumerate(tasks[:num_episodes]):
+        instruction = task.language
+        bddl_path = benchmark.get_task_bddl_file_path(task_idx)
+        task_env = OffScreenRenderEnv(bddl_file_name=bddl_path)
+        save_dir = os.path.join(output_dir, f"task_{task_idx:02d}") if True else ""
 
-        t_start = time.time()
-        result = evaluate_single_task(
-            model=model,
-            processor=processor,
-            env=task_env,
+        t0 = time.time()
+        result = evaluate_task(
+            vla=vla, env=task_env,
             instruction=instruction,
-            device=cfg.device,
-            max_steps=cfg.max_steps,
-            render_freq=cfg.render_freq,
-            save_dir=os.path.join(cfg.output_dir, f"task_{task_idx:02d}"),
+            max_steps=max_steps, save_dir=save_dir,
+            verbose=verbose,
         )
-        elapsed = time.time() - t_start
+        elapsed = time.time() - t0
 
         result["task_idx"] = task_idx
         result["instruction"] = instruction
         result["elapsed_s"] = elapsed
-
         results.append(result)
 
-        if cfg.verbose:
-            status = "✓ SUCCESS" if result["success"] else "✗ FAIL"
-            print(f"  → {status}  | return={result['episode_return']:.3f}  "
-                  f"| len={result['episode_len']}  | {elapsed:.1f}s\n")
+        status = "[green]✓ SUCCESS[/green]" if result["success"] else "[red]✗ FAIL[/red]"
+        task_table.add_row(
+            f"{task_idx:02d}",
+            instruction[:50] + "...",
+            status,
+            f"{result['episode_return']:.3f}",
+            str(result["episode_len"]),
+            f"{elapsed:.1f}s",
+        )
+        console.print(task_table, end="\r")
 
-    # --- 汇总统计 ---
+    console.print()  # 换行
+
+    # 汇总
     success_count = sum(r["success"] for r in results)
     success_rate = success_count / len(results) * 100
     mean_return = np.mean([r["episode_return"] for r in results])
     mean_len = np.mean([r["episode_len"] for r in results])
 
     summary = {
-        "task_suite": cfg.task_suite,
-        "checkpoint": cfg.checkpoint,
+        "task_suite": task_suite,
+        "checkpoint": checkpoint,
         "num_tasks_evaluated": len(results),
         "success_count": success_count,
         "success_rate": f"{success_rate:.1f}%",
@@ -383,22 +258,68 @@ def main(cfg: EvalConfig):
         "per_task_results": results,
     }
 
-    # --- 保存结果 ---
-    summary_path = os.path.join(cfg.output_dir, "summary.json")
+    summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    print(f"\n{'='*60}")
-    print(f"评测完成!")
-    print(f"  任务数量: {len(results)}")
-    print(f"  成功率:  {success_count}/{len(results)} = {success_rate:.1f}%")
-    print(f"  平均奖励: {mean_return:.3f}")
-    print(f"  平均步数: {mean_len:.1f}")
-    print(f"  结果已保存到: {summary_path}")
-    print(f"{'='*60}")
+
+    # 生成 markdown 报告
+    _cfg = type("EvalCfg", (), {
+        "max_steps": max_steps,
+        "seed": seed,
+        "device": device,
+        "max_new_tokens": max_new_tokens,
+    })()
+    report_path = generate_markdown_report(summary, output_dir, _cfg)
+    warn(f"Markdown 报告已生成: {report_path}")
+
+    # 汇总输出
+    section("评测结果汇总", "green")
+    result_table = Table(box=None)
+    result_table.add_column("指标", style="yellow bold")
+    result_table.add_column("值", style="cyan")
+    result_table.add_row("任务数量", str(len(results)))
+    result_table.add_row("成功数", f"{success_count}/{len(results)}")
+    result_table.add_row("成功率", f"[green]{success_rate:.1f}%[/green]")
+    result_table.add_row("平均奖励", f"{mean_return:.3f}")
+    result_table.add_row("平均步数", f"{mean_len:.1f}")
+    result_table.add_row("结果文件", summary_path)
+    console.print(result_table)
 
     return summary
 
 
+# ==============================================================================
+# tyro CLI
+# ==============================================================================
+
 if __name__ == "__main__":
+    import tyro
+    from dataclasses import dataclass
+
+    @dataclass
+    class EvalConfig:
+        checkpoint: str = "./checkpoints/final"
+        model_id: str = "jingyaogong/minimind2-v"
+        task_suite: str = "LIBERO_OBJECT"
+        num_episodes: int = 10
+        max_steps: int = 400
+        max_new_tokens: int = 64
+        output_dir: str = "./eval_results"
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        seed: int = 42
+        verbose: bool = True  # 是否显示 VLA 推理输出
+
+    tyro.extras.set_accent_color("cyan")
     cfg = tyro.cli(EvalConfig)
-    main(cfg)
+    run_eval(
+        checkpoint=cfg.checkpoint,
+        model_id=cfg.model_id,
+        task_suite=cfg.task_suite,
+        num_episodes=cfg.num_episodes,
+        max_steps=cfg.max_steps,
+        max_new_tokens=cfg.max_new_tokens,
+        output_dir=cfg.output_dir,
+        device=cfg.device,
+        seed=cfg.seed,
+        verbose=cfg.verbose,
+    )
